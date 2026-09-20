@@ -43,6 +43,7 @@
 #include "goodix.h"
 #include "goodix_proto.h"
 #include "goodix534b.h"
+#include "goodix534b_recovery.h"
 #include "gx534b_match.h"
 
 #define IMAGE_TIMEOUT_MS 3000
@@ -65,6 +66,9 @@ struct _FpiDeviceGoodixTls534b
 
   GByteArray *enroll_views;   /* quantized views collected so far */
   int         enroll_stage;
+
+  gboolean in_iap;            /* firmware reported the IAP bootloader */
+  guint    recovery_offset;   /* next write_firmware offset during recovery */
 };
 
 G_DECLARE_FINAL_TYPE (FpiDeviceGoodixTls534b, fpi_device_goodixtls534b, FPI,
@@ -254,6 +258,14 @@ fw_version_cb (FpDevice *dev, gchar *firmware, gpointer ssm, GError *err)
       return;
     }
   fp_dbg ("Device firmware: \"%s\"", firmware);
+  if (strstr (firmware, "_IAP_"))
+    {
+      /* bootloader mode: the application must be restored before anything else
+       * (the sensor lands here after an application crash) */
+      FPI_DEVICE_GOODIXTLS534B (dev)->in_iap = TRUE;
+      fpi_ssm_mark_completed (ssm);
+      return;
+    }
   fpi_ssm_next_state (ssm);
 }
 
@@ -372,6 +384,128 @@ post_tls_run_state (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
+/* ---- IAP recovery: replay the Windows driver's write/check/reset sequence ---- */
+
+enum recovery_states {
+  RECOVERY_WRITE,
+  RECOVERY_CHECK,
+  RECOVERY_NUM_STATES,
+};
+
+static void
+recovery_write_cb (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
+  if (err)
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  if (!data || len < 1 || data[0] != 0x01)
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                          "recovery: write_firmware at %u rejected",
+                                                          self->recovery_offset));
+      return;
+    }
+  self->recovery_offset += GOODIX_534B_RECOVERY_CHUNK;
+  if (self->recovery_offset < sizeof (goodix_534b_recovery_blob))
+    fpi_ssm_jump_to_state (ssm, RECOVERY_WRITE);
+  else
+    fpi_ssm_next_state (ssm);
+}
+
+static void
+recovery_check_cb (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+{
+  if (err)
+    {
+      fpi_ssm_mark_failed (ssm, err);
+      return;
+    }
+  if (!data || len < 1 || data[0] != 0x01)
+    {
+      fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                          "recovery: check_firmware rejected"));
+      return;
+    }
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+recovery_run_state (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case RECOVERY_WRITE:
+      {
+        guint off = self->recovery_offset;
+        guint len = MIN (GOODIX_534B_RECOVERY_CHUNK, sizeof (goodix_534b_recovery_blob) - off);
+        guint8 *body = g_malloc (12 + len);
+        guint32 hdr[3] = { GUINT32_TO_LE (off), GUINT32_TO_LE (len),
+                           GUINT32_TO_LE (GOODIX_534B_RECOVERY_NUMBER) };
+
+        memcpy (body, hdr, 12);
+        memcpy (body + 12, goodix_534b_recovery_blob + off, len);
+        if (off == 0)
+          fp_warn ("sensor is in its IAP bootloader; restoring the application firmware");
+        goodix_send_protocol (dev, 0xf0, body, 12 + len, g_free, TRUE, 3000, TRUE,
+                              goodix_receive_default,
+                              g_memdup2 (&(GoodixCallbackInfo){ G_CALLBACK (recovery_write_cb), ssm },
+                                         sizeof (GoodixCallbackInfo)));
+        break;
+      }
+
+    case RECOVERY_CHECK:
+      send_raw (dev, 0xf4, goodix_534b_recovery_hmac, sizeof (goodix_534b_recovery_hmac),
+                TRUE, 5000, recovery_check_cb, ssm);
+      break;
+
+    }
+}
+
+static void
+open_failed (FpDevice *dev, GError *error);
+
+/* Fired after the failed open has been reported: the soft MCU reset makes the sensor
+ * drop off the bus, and libfprint must not see that while the open task's deferred
+ * return is still pending (it dereferences the device after fprintd released it). */
+static void
+recovery_reset_timeout (FpDevice *dev, gpointer user_data)
+{
+  guint8 *pkt;
+  guint32 pkt_len;
+  GError *err = NULL;
+
+  goodix_encode_protocol (GOODIX_CMD_RESET, (const guint8 *) "\x02\x32", 2, TRUE,
+                          FALSE, &pkt, &pkt_len);
+  if (!goodix_send_pack (dev, GOODIX_FLAGS_MSG_PROTOCOL, pkt, pkt_len, g_free, &err))
+    {
+      fp_warn ("recovery: reset failed: %s", err->message);
+      g_clear_error (&err);
+    }
+  goodix_dev_deinit (dev, &err);
+  g_clear_error (&err);
+}
+
+static void
+recovery_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  if (error)
+    {
+      open_failed (dev, error);
+      return;
+    }
+  fp_warn ("application firmware restored; the sensor will reboot and re-enumerate, retry the operation");
+  fpi_device_open_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_BUSY,
+                                                           "sensor was in bootloader mode and has been restored; "
+                                                           "it is reconnecting, please retry"));
+  fpi_device_add_timeout (dev, 300, recovery_reset_timeout, NULL, NULL);
+}
+
 static void
 open_failed (FpDevice *dev, GError *error)
 {
@@ -409,9 +543,19 @@ tls_done (FpDevice *dev, gpointer user_data, GError *error)
 static void
 activate_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
   if (error)
     {
       open_failed (dev, error);
+      return;
+    }
+  if (self->in_iap)
+    {
+      self->in_iap = FALSE;
+      self->recovery_offset = 0;
+      fpi_ssm_start (fpi_ssm_new (dev, recovery_run_state, RECOVERY_NUM_STATES),
+                     recovery_complete);
       return;
     }
   goodix_tls_init (dev, tls_done, NULL);

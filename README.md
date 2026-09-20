@@ -82,6 +82,23 @@ Python tools used to get there in `goodix-534b/tools/` (`gxfinal.py` captures a
 fingerprint from the command line; `gxcollect.py` collects touches for matcher
 experiments).
 
+## Bootloader (IAP) recovery
+
+After an application crash the sensor reboots into its `MILAN_GM168SEC_IAP_10007`
+bootloader and stays there (firmware version query answers, everything else times
+out) until the host restores the application. The Windows driver does this by
+writing a 25 KB blob in 256-byte `write_firmware` (0xf0) chunks, sending
+`check_firmware` (0xf4) with a 32-byte HMAC and a soft MCU reset (0xa2, `02 32`);
+both blob and HMAC are constant, so the driver replays them
+(`goodix534b_recovery.h`, captured with usbmon). The sensor re-enumerates after the
+reset, so the open that triggered the recovery fails with "sensor was in bootloader
+mode and has been restored ... please retry" and the next open works. The reset is
+fired 300 ms after that failure is reported: if the device drops off the bus while
+libfprint's deferred task return is still pending, fprintd crashes (use after free
+in `fp_device_task_return_in_idle_cb`). A cold plug
+does not cause this; a crashed application does. The blob is Goodix's firmware data,
+replayed verbatim like the firmware files in goodix-fp-dump.
+
 ## Caveats
 
 - **The PSK.** The sensor encrypts images over TLS-PSK. The key in `goodix534b.h`
