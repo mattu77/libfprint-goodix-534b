@@ -14,6 +14,7 @@ Status (tested on Fedora 44, fprintd 1.94.5):
 | `fprintd-verify`, enrolled finger | match, score ≈0.86 |
 | `fprintd-verify`, other finger | no match, score ≈0.21 |
 | Plasma lock screen unlock | first touch, score ≈0.73 (`kde-fingerprint` → `fingerprint-auth` → `pam_fprintd`) |
+| Plasma Login Manager | empty password + touch, score ≈0.63 (sequential PAM stack, see below) |
 | PAM | `authselect enable-feature with-fingerprint` (Fedora) |
 
 Everything here was reverse engineered from the Windows driver and USB captures;
