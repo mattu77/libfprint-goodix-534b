@@ -88,6 +88,7 @@ nbis_sources = [
 ]
 
 driver_sources = {
+    'goodixtls534b' : files('drivers/goodixtls/goodix534b.c', 'drivers/goodixtls/gx534b_match.c'),
     'upekts' : files(
         'drivers/upekts.c',
         'drivers/upek_proto.c',
@@ -142,6 +143,11 @@ driver_sources = {
 }
 
 helper_sources = {
+    'goodixtls': files(
+        'drivers/goodixtls/goodix.c',
+        'drivers/goodixtls/goodix_proto.c',
+        'drivers/goodixtls/goodixtls.c',
+    ),
     'aeslib': files('drivers/aeslib.c'),
     'aesx660': files('drivers/aesx660.c'),
     'aes3k': files('drivers/aes3k.c'),
