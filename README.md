@@ -47,8 +47,18 @@ sudo authselect enable-feature with-fingerprint   # PAM (Fedora)
 ```
 
 On Fedora that adds `pam_fprintd` to `system-auth` and `fingerprint-auth`; the Plasma
-lock screen and SDDM use the `kde-fingerprint`/`sddm-fingerprint` services on top of
-`fingerprint-auth`, so they pick it up as well. Without `G_MESSAGES_DEBUG=all` in the
+lock screen uses the `kde-fingerprint` service on top of `fingerprint-auth`, so it picks
+it up as well. Plasma Login Manager (`plasmalogin`) has no fingerprint authenticator, so
+there the sensor can only sit in the sequential stack, `/etc/pam.d/plasmalogin`:
+
+```
+auth  [success=done default=ignore]  pam_fprintd.so timeout=10 max-tries=1
+auth  substack  password-auth
+```
+
+Press Enter with an empty password and touch the sensor within 10 s to log in; a typed
+password waits for the fingerprint timeout first (touch with any finger to skip it).
+Logging in by fingerprint cannot unlock KWallet, which needs the password. Without `G_MESSAGES_DEBUG=all` in the
 fprintd unit override, fprintd logs nothing about verifications — add it while testing.
 
 Without fprintd: `echo 6 | build/examples/enroll` (6 = right index) and
