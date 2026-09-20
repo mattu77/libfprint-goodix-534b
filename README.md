@@ -13,7 +13,8 @@ Status (tested on Fedora 44, fprintd 1.94.5):
 | `fprintd-enroll` (16 touches) | completes, no retries |
 | `fprintd-verify`, enrolled finger | match, score ≈0.86 |
 | `fprintd-verify`, other finger | no match, score ≈0.21 |
-| PAM login / screen unlock | works via `authselect enable-feature with-fingerprint` |
+| Plasma lock screen unlock | first touch, score ≈0.73 (`kde-fingerprint` → `fingerprint-auth` → `pam_fprintd`) |
+| PAM | `authselect enable-feature with-fingerprint` (Fedora) |
 
 Everything here was reverse engineered from the Windows driver and USB captures;
 nothing came from Goodix. Read the caveats below before relying on it.
@@ -44,6 +45,11 @@ fprintd-enroll                # 16 touches, ~1 s each, keep the finger roughly c
 fprintd-verify
 sudo authselect enable-feature with-fingerprint   # PAM (Fedora)
 ```
+
+On Fedora that adds `pam_fprintd` to `system-auth` and `fingerprint-auth`; the Plasma
+lock screen and SDDM use the `kde-fingerprint`/`sddm-fingerprint` services on top of
+`fingerprint-auth`, so they pick it up as well. Without `G_MESSAGES_DEBUG=all` in the
+fprintd unit override, fprintd logs nothing about verifications — add it while testing.
 
 Without fprintd: `echo 6 | build/examples/enroll` (6 = right index) and
 `build/examples/verify` store the print in `./test-storage.variant`;
