@@ -49,7 +49,17 @@ sudo authselect enable-feature with-fingerprint   # PAM (Fedora)
 
 On Fedora that adds `pam_fprintd` to `system-auth` and `fingerprint-auth`; the Plasma
 lock screen uses the `kde-fingerprint` service on top of `fingerprint-auth`, so it picks
-it up as well. Plasma Login Manager (`plasmalogin`) has no fingerprint authenticator, so
+it up as well — with one catch. kscreenlocker starts its authenticators when the screen
+is woken and never restarts a non-interactive one after it fails, and `pam_fprintd`'s
+defaults (30 s × 3 tries) stop listening ~96 s later, so a touch after the monitors have
+slept does nothing. Make the lock screen listen until a touch in `/etc/pam.d/kde-fingerprint`:
+
+```
+auth  required                    pam_env.so
+auth  [success=done default=bad]  pam_fprintd.so timeout=-1 max-tries=-1
+auth  required                    pam_deny.so
+auth  include                     postlogin
+``` Plasma Login Manager (`plasmalogin`) has no fingerprint authenticator, so
 there the sensor can only sit in the sequential stack. Password first, fingerprint only
 when the password is empty or wrong (a later module cannot override a failed
 `password-auth` substack, hence the explicit lines and the jump), `/etc/pam.d/plasmalogin`:
