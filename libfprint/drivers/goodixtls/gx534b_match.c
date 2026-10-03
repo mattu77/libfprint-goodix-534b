@@ -21,12 +21,22 @@
 #define H GX534B_VIEW_H
 #define N 128                     /* POC FFT size (power of two >= W, H) */
 #define NORM_RADIUS 8             /* local normalisation window: 17x17 */
+#ifndef BAND_FRAC
 #define BAND_FRAC 0.35            /* BLPOC keeps |k| <= 0.35 * (size/2) */
+#endif
+#ifndef ROT_MAX
 #define ROT_MAX 12
+#endif
+#ifndef ROT_STEP
 #define ROT_STEP 3
+#endif
+#ifndef MIN_OVERLAP
 #define MIN_OVERLAP 0.4           /* common region must cover this much of a view */
+#endif
 #define MIN_REGION 24             /* ... and be at least this many px each way */
+#ifndef PEAK_SEARCH
 #define PEAK_SEARCH 6             /* BLPOC peak searched within +-6 px of alignment */
+#endif
 
 typedef struct { float re, im; } cpx;
 

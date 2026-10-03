@@ -10,7 +10,7 @@ Status (tested on Fedora 44, fprintd 1.94.5):
 
 | step | result |
 |---|---|
-| `fprintd-enroll` (16 touches) | completes, no retries |
+| `fprintd-enroll` (24 touches) | completes |
 | `fprintd-verify`, enrolled finger | match, score ≈0.86 |
 | `fprintd-verify`, other finger | no match, score ≈0.21 |
 | Plasma lock screen unlock | first touch, score ≈0.73 (`kde-fingerprint` → `fingerprint-auth` → `pam_fprintd`) |
@@ -118,6 +118,21 @@ The protocol notes are in `goodix-534b/docs/` (`FLOW.md` is the current picture,
 Python tools used to get there in `goodix-534b/tools/` (`gxfinal.py` captures a
 fingerprint from the command line; `gxcollect.py` collects touches for matcher
 experiments).
+
+## Adaptive template and enrollment
+
+A touch that does not overlap any enrolled view scores like a different finger (≈0.2),
+so coverage of the fingertip decides the miss rate. Two things help:
+
+- **Enrollment spreads views**: 24 touches; place the finger centred for the first few,
+  then deliberately shifted left/right/up/down and tilted, so the views tile the
+  fingertip rather than repeat its centre.
+- **The template learns**: after a successful verify with a partial-overlap score
+  (0.45–0.80) the probe view is saved under `/var/lib/fprint/goodixtls534b-learned/<sha256
+  of the template>.bin` (up to 24 views) and used in later matches, so coverage grows
+  with use. Views are only ever added after a match, never from failed attempts. Delete
+  that file to forget them (it is keyed by the template, so re-enrolling starts fresh).
+- Each touch yields two frames; the earlier one is matched too when the later one misses.
 
 ## Bootloader (IAP) recovery
 

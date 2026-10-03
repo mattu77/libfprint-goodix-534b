@@ -51,17 +51,26 @@
 #define FDT_WAIT_TIMEOUT_MS 300    /* finger wait: re-poll 0x32 this often */
 #define GARBAGE_STDDEV 900.0       /* no capture yet: ~1180, real frames: ~500-650 */
 #define LIFT_CLEAR_POLLS 2
-#define ENROLL_STAGES 16
+#define ENROLL_STAGES 24
 
 #define TEMPLATE_MAGIC "GX534B01"
+
+/* Adaptive template: views of touches that matched only partially (score below
+ * LEARN_BELOW) are saved next to fprintd's storage, keyed by the template hash, and
+ * used in later matches, so the covered finger area grows with use. */
+#define LEARN_DIR "/var/lib/fprint/goodixtls534b-learned"
+#define LEARN_MAX 24
+#define LEARN_BELOW 0.80f
 
 struct _FpiDeviceGoodixTls534b
 {
   FpiDeviceGoodixTls parent;
 
   guint16 *baseline;    /* stored calibration frame (fixed pattern), per open */
-  guint16 *finger;      /* decoded frame with the finger down */
+  guint16 *finger;      /* decoded frame with the finger down (last one) */
+  guint16 *finger1;     /* the earlier frame of the same touch, if two were taken */
   float   *probe;       /* ridge map of the last touch */
+  float   *probe1;      /* ridge map of the earlier frame, or NULL */
   int      lift_clear;  /* consecutive polls without a finger */
 
   GByteArray *enroll_views;   /* quantized views collected so far */
@@ -222,6 +231,78 @@ template_views (FpPrint *print, int *n_views, GVariant **keep)
     return NULL;
   *keep = g_steal_pointer (&data);
   return (const gint8 *) bytes + 12;
+}
+
+/* ---- adaptive template -------------------------------------------------- */
+
+static gchar *
+learned_path (const gint8 *views, int n_views)
+{
+  g_autofree gchar *hash = g_compute_checksum_for_data (G_CHECKSUM_SHA256, (const guchar *) views,
+                                                        (gsize) n_views * GX534B_VIEW_PIXELS);
+
+  return g_strdup_printf (LEARN_DIR "/%s.bin", hash);
+}
+
+/* Enrolled views followed by the learned ones; caller frees. */
+static gint8 *
+all_views (const gint8 *views, int n_views, const gchar *path, int *n_all, int *n_learned)
+{
+  g_autofree gchar *data = NULL;
+  gsize len = 0;
+  int nl = 0;
+  gint8 *all;
+
+  if (g_file_get_contents (path, &data, &len, NULL))
+    nl = MIN ((int) (len / GX534B_VIEW_PIXELS), LEARN_MAX);
+  all = g_malloc ((gsize) (n_views + nl) * GX534B_VIEW_PIXELS);
+  memcpy (all, views, (gsize) n_views * GX534B_VIEW_PIXELS);
+  if (nl)
+    memcpy (all + (gsize) n_views * GX534B_VIEW_PIXELS, data, (gsize) nl * GX534B_VIEW_PIXELS);
+  *n_all = n_views + nl;
+  *n_learned = nl;
+  return all;
+}
+
+static void
+learn_view (const gchar *path, const gint8 *all, int n_views, int n_learned, const float *probe)
+{
+  gint8 q[GX534B_VIEW_PIXELS];
+  g_autoptr(GByteArray) buf = g_byte_array_new ();
+  g_autoptr(GError) err = NULL;
+
+  if (n_learned >= LEARN_MAX)
+    return;
+  gx534b_quantize (probe, q);
+  g_byte_array_append (buf, (const guint8 *) (all + (gsize) n_views * GX534B_VIEW_PIXELS),
+                       (guint) n_learned * GX534B_VIEW_PIXELS);
+  g_byte_array_append (buf, (const guint8 *) q, sizeof q);
+  g_mkdir_with_parents (LEARN_DIR, 0700);
+  if (!g_file_set_contents (path, (const gchar *) buf->data, buf->len, &err))
+    fp_warn ("could not save learned view: %s", err->message);
+  else
+    fp_dbg ("learned view %d/%d saved", n_learned + 1, LEARN_MAX);
+}
+
+/* Score of the touch: the last frame, and the earlier one if that misses. */
+static float
+match_touch (FpiDeviceGoodixTls534b *self, const gint8 *views, int n, const float **used)
+{
+  float s = gx534b_match (self->probe, views, n);
+
+  *used = self->probe;
+  if (s < GX534B_MATCH_THRESHOLD && self->probe1)
+    {
+      float s1 = gx534b_match (self->probe1, views, n);
+
+      fp_dbg ("first frame: score %.2f", s1);
+      if (s1 > s)
+        {
+          s = s1;
+          *used = self->probe1;
+        }
+    }
+  return s;
 }
 
 /* ---- open: init commands, TLS, config, calibration frame ---------------- */
@@ -584,7 +665,9 @@ dev_close (FpDevice *dev)
   goodix_dev_deinit (dev, &error);
   g_clear_pointer (&self->baseline, g_free);
   g_clear_pointer (&self->finger, g_free);
+  g_clear_pointer (&self->finger1, g_free);
   g_clear_pointer (&self->probe, g_free);
+  g_clear_pointer (&self->probe1, g_free);
   fpi_device_close_complete (dev, error);
 }
 
@@ -677,7 +760,8 @@ on_finger_image (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError 
       return;
     }
   fp_dbg ("finger frame stddev %.0f", frame_stddev (px));
-  g_free (self->finger);
+  g_free (self->finger1);
+  self->finger1 = self->finger;   /* the first frame of this touch, if any */
   self->finger = px;
   fpi_ssm_next_state (ssm);
 }
@@ -751,6 +835,13 @@ touch_run_state (FpiSsm *ssm, FpDevice *dev)
         self->probe = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
       gx534b_prep_view (self->finger, self->baseline, self->probe);
       g_clear_pointer (&self->finger, g_free);
+      g_clear_pointer (&self->probe1, g_free);
+      if (self->finger1)
+        {
+          self->probe1 = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+          gx534b_prep_view (self->finger1, self->baseline, self->probe1);
+          g_clear_pointer (&self->finger1, g_free);
+        }
       self->lift_clear = 0;
       fpi_ssm_next_state (ssm);
       break;
@@ -772,6 +863,7 @@ touch_start (FpDevice *dev)
 
   self->lift_clear = 0;
   g_clear_pointer (&self->finger, g_free);
+  g_clear_pointer (&self->finger1, g_free);
   fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_NONE);
   fpi_ssm_start (fpi_ssm_new (dev, touch_run_state, TOUCH_NUM_STATES), touch_complete);
 }
@@ -823,8 +915,18 @@ verify_touch_done (FpDevice *dev)
                                                                  "print is not a goodixtls534b template"));
       return;
     }
-  score = gx534b_match (self->probe, views, n_views);
-  fp_dbg ("verify: score %.2f over %d views (threshold %.2f)", score, n_views, GX534B_MATCH_THRESHOLD);
+  {
+    g_autofree gchar *path = learned_path (views, n_views);
+    int n_all, n_learned;
+    g_autofree gint8 *all = all_views (views, n_views, path, &n_all, &n_learned);
+    const float *used;
+
+    score = match_touch (self, all, n_all, &used);
+    fp_dbg ("verify: score %.2f over %d views (%d learned, threshold %.2f)",
+            score, n_all, n_learned, GX534B_MATCH_THRESHOLD);
+    if (score >= GX534B_MATCH_THRESHOLD && score < LEARN_BELOW)
+      learn_view (path, all, n_views, n_learned, used);
+  }
   fpi_device_verify_report (dev, score >= GX534B_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
                             NULL, NULL);
   fpi_device_verify_complete (dev, NULL);
@@ -837,6 +939,10 @@ identify_touch_done (FpDevice *dev)
   GPtrArray *prints = NULL;
   FpPrint *best = NULL;
   float best_score = 0;
+  g_autofree gchar *best_path = NULL;
+  g_autofree gint8 *best_all = NULL;
+  int best_n_views = 0, best_n_learned = 0;
+  const float *best_used = NULL;
 
   fpi_device_get_identify_data (dev, &prints);
   for (guint i = 0; prints && i < prints->len; i++)
@@ -849,14 +955,28 @@ identify_touch_done (FpDevice *dev)
 
       if (!views)
         continue;
-      score = gx534b_match (self->probe, views, n_views);
-      fp_dbg ("identify: print %u score %.2f over %d views", i, score, n_views);
-      if (score > best_score)
-        {
-          best_score = score;
-          best = print;
-        }
+      {
+        g_autofree gchar *path = learned_path (views, n_views);
+        int n_all, n_learned;
+        gint8 *all = all_views (views, n_views, path, &n_all, &n_learned);
+        const float *used;
+
+        score = match_touch (self, all, n_all, &used);
+        fp_dbg ("identify: print %u score %.2f over %d views (%d learned)", i, score, n_all, n_learned);
+        if (score > best_score)
+          {
+            best_score = score;
+            best = print;
+            g_free (best_path); best_path = g_steal_pointer (&path);
+            g_free (best_all); best_all = all;
+            best_n_views = n_views; best_n_learned = n_learned; best_used = used;
+          }
+        else
+          g_free (all);
+      }
     }
+  if (best && best_score >= GX534B_MATCH_THRESHOLD && best_score < LEARN_BELOW)
+    learn_view (best_path, best_all, best_n_views, best_n_learned, best_used);
   fpi_device_identify_report (dev, best_score >= GX534B_MATCH_THRESHOLD ? best : NULL, NULL, NULL);
   fpi_device_identify_complete (dev, NULL);
 }
