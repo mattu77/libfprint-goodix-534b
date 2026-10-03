@@ -485,8 +485,14 @@ goodix_receive_timeout_cb (FpDevice *dev, gpointer user_data)
     fpi_device_goodixtls_get_instance_private (self);
   GError *error = NULL;
 
-  g_set_error (&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
-               "Command timed out: 0x%02x", priv->cmd);
+  /* no ACK at all means the sensor firmware is not answering (it needs a USB
+   * reset); a missing reply after an ACK is the ordinary timeout */
+  if (priv->ack)
+    g_set_error (&error, G_IO_ERROR, G_IO_ERROR_HOST_UNREACHABLE,
+                 "No ACK for command: 0x%02x", priv->cmd);
+  else
+    g_set_error (&error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT,
+                 "Command timed out: 0x%02x", priv->cmd);
   goodix_receive_done (dev, NULL, 0, error);
 }
 

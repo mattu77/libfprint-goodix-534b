@@ -51,6 +51,7 @@
 #define FDT_WAIT_TIMEOUT_MS 300    /* finger wait: re-poll 0x32 this often */
 #define GARBAGE_STDDEV 900.0       /* no capture yet: ~1180, real frames: ~500-650 */
 #define LIFT_CLEAR_POLLS 2
+#define NO_ACK_LIMIT 10            /* unanswered polls before giving the action up */
 #define ENROLL_STAGES 24
 
 #define TEMPLATE_MAGIC "GX534B01"
@@ -77,6 +78,8 @@ struct _FpiDeviceGoodixTls534b
   int         enroll_stage;
 
   gboolean in_iap;            /* firmware reported the IAP bootloader */
+  gboolean did_reset;         /* USB reset already tried during this open */
+  int      no_ack;            /* consecutive polls the sensor did not ACK */
   guint    recovery_offset;   /* next write_firmware offset during recovery */
 };
 
@@ -333,8 +336,29 @@ enum post_tls_states {
 static void
 fw_version_cb (FpDevice *dev, gchar *firmware, gpointer ssm, GError *err)
 {
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
   if (err)
     {
+      /* the firmware sometimes stops answering altogether (seen after long
+       * multi-touch sessions); a USB reset brings it back */
+      if (!self->did_reset &&
+          (g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) ||
+           g_error_matches (err, G_IO_ERROR, G_IO_ERROR_HOST_UNREACHABLE)))
+        {
+          GError *rerr = NULL;
+
+          self->did_reset = TRUE;
+          fp_warn ("sensor is not answering (%s); resetting it over USB", err->message);
+          g_error_free (err);
+          if (!g_usb_device_reset (fpi_device_get_usb_device (dev), &rerr))
+            {
+              fpi_ssm_mark_failed (ssm, rerr);
+              return;
+            }
+          fpi_ssm_jump_to_state (ssm, ACTIVATE_NOP);
+          return;
+        }
       fpi_ssm_mark_failed (ssm, err);
       return;
     }
@@ -652,6 +676,7 @@ dev_open (FpDevice *dev)
       fpi_device_open_complete (dev, error);
       return;
     }
+  FPI_DEVICE_GOODIXTLS534B (dev)->did_reset = FALSE;
   fpi_ssm_start (fpi_ssm_new (dev, activate_run_state, ACTIVATE_NUM_STATES),
                  activate_complete);
 }
@@ -697,11 +722,23 @@ check_cancelled (FpDevice *dev, FpiSsm *ssm)
 static void
 on_fdt_down (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
 {
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
   if (err)
     {
-      if (g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+      gboolean no_ack = g_error_matches (err, G_IO_ERROR, G_IO_ERROR_HOST_UNREACHABLE);
+
+      if (no_ack || g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
         {
           g_error_free (err);
+          self->no_ack = no_ack ? self->no_ack + 1 : 0;
+          if (self->no_ack >= NO_ACK_LIMIT)
+            {
+              fp_warn ("sensor stopped answering while waiting for a finger");
+              fpi_ssm_mark_failed (ssm, fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                                  "sensor stopped answering; it will be reset on the next use"));
+              return;
+            }
           if (!check_cancelled (dev, ssm))
             fpi_ssm_jump_to_state (ssm, TOUCH_FDT_DOWN);
           return;
@@ -709,6 +746,7 @@ on_fdt_down (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err
       fpi_ssm_mark_failed (ssm, err);
       return;
     }
+  self->no_ack = 0;
   if (fdt_finger_down (data, len))
     {
       fp_dbg ("finger down");
@@ -862,6 +900,7 @@ touch_start (FpDevice *dev)
   FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
 
   self->lift_clear = 0;
+  self->no_ack = 0;
   g_clear_pointer (&self->finger, g_free);
   g_clear_pointer (&self->finger1, g_free);
   fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_NONE);
