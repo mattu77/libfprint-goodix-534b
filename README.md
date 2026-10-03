@@ -119,6 +119,12 @@ Python tools used to get there in `goodix-534b/tools/` (`gxfinal.py` captures a
 fingerprint from the command line; `gxcollect.py` collects touches for matcher
 experiments).
 
+Polkit prompts (Discover updates, System Settings) and `sudo` need nothing extra:
+their PAM services include `system-auth`, where authselect put `pam_fprintd` first.
+Verified with `pkexec`: audit `grantors=pam_fprintd`. The fingerprint step runs before
+the password there, so a typed password is accepted only once it gives up (30 s × 3
+tries by default); touching the sensor with any finger ends the wait.
+
 ## Adaptive template and enrollment
 
 A touch that does not overlap any enrolled view scores like a different finger (≈0.2),
