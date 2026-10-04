@@ -362,6 +362,50 @@ blpoc_region (const float *a, const float *b, int stride, int rh, int rw)
 
 /* ---- top level ---------------------------------------------------------- */
 
+typedef struct
+{
+  const cpx   *fv;       /* view spectra */
+  const gint8 *views;
+  const float *rp;       /* rotated probe */
+  const cpx   *fp;       /* its spectrum */
+  int          v0, v1;   /* view range of this job */
+  float        best;
+} MatchJob;
+
+static gpointer
+match_job (gpointer data)
+{
+  MatchJob *job = data;
+  g_autofree float *view = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+  g_autofree float *region_a = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+  g_autofree float *region_b = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+
+  for (int v = job->v0; v < job->v1; v++)
+    {
+      int dy, dx, y0, y1, x0, x1, rh, rw;
+      float s;
+
+      /* shift of the rotated probe relative to the view */
+      poc_shift (job->fv + v * N * N, job->fp, &dy, &dx);
+      y0 = MAX (0, dy); y1 = MIN (H, H + dy);
+      x0 = MAX (0, dx); x1 = MIN (W, W + dx);
+      rh = y1 - y0; rw = x1 - x0;
+      if (rh < MIN_REGION || rw < MIN_REGION || rh * rw < MIN_OVERLAP * H * W)
+        continue;
+      gx534b_dequantize (job->views + v * GX534B_VIEW_PIXELS, view);
+      for (int y = 0; y < rh; y++)
+        for (int x = 0; x < rw; x++)
+          {
+            region_a[y * rw + x] = view[(y0 + y) * W + (x0 + x)];
+            region_b[y * rw + x] = job->rp[(y0 - dy + y) * W + (x0 - dx + x)];
+          }
+      s = blpoc_region (region_a, region_b, rw, rh, rw);
+      if (s > job->best)
+        job->best = s;
+    }
+  return NULL;
+}
+
 float
 gx534b_match (const float *probe, const gint8 *views, int n_views)
 {
@@ -369,41 +413,41 @@ gx534b_match (const float *probe, const gint8 *views, int n_views)
   g_autofree cpx *fp = g_malloc (N * N * sizeof (cpx));
   g_autofree float *view = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
   g_autofree float *rp = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
-  g_autofree float *region_a = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
-  g_autofree float *region_b = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+  int nthreads = CLAMP ((int) g_get_num_processors (), 1, 16);
   float best = 0;
 
+  if (nthreads > n_views)
+    nthreads = n_views;
   for (int v = 0; v < n_views; v++)
     {
       gx534b_dequantize (views + v * GX534B_VIEW_PIXELS, view);
-      view_spectrum (view, fv + v * N * N);
+      view_spectrum (view, fv + v * N * N);   /* also initialises the FFT twiddles */
     }
 
-  for (int deg = -ROT_MAX; deg <= ROT_MAX; deg += ROT_STEP)
+  /* rotations in the order 0, -s, +s, -2s, +2s, ...: most touches match at 0 and
+   * a view scoring >= GX534B_MATCH_EARLY_EXIT ends the search */
+  for (int r = 0; r <= 2 * (ROT_MAX / ROT_STEP); r++)
     {
+      int deg = (r + 1) / 2 * ROT_STEP * ((r & 1) ? -1 : 1);
+      MatchJob jobs[16];
+      GThread *threads[16];
+
+      if (best >= GX534B_MATCH_EARLY_EXIT)
+        break;
       rotate_view (probe, rp, (float) deg);
       view_spectrum (rp, fp);
-      for (int v = 0; v < n_views; v++)
+      for (int t = 0; t < nthreads; t++)
         {
-          int dy, dx, y0, y1, x0, x1, rh, rw;
-
-          /* shift of the rotated probe relative to the view */
-          poc_shift (fv + v * N * N, fp, &dy, &dx);
-          y0 = MAX (0, dy); y1 = MIN (H, H + dy);
-          x0 = MAX (0, dx); x1 = MIN (W, W + dx);
-          rh = y1 - y0; rw = x1 - x0;
-          if (rh < MIN_REGION || rw < MIN_REGION || rh * rw < MIN_OVERLAP * H * W)
-            continue;
-          gx534b_dequantize (views + v * GX534B_VIEW_PIXELS, view);
-          for (int y = 0; y < rh; y++)
-            for (int x = 0; x < rw; x++)
-              {
-                region_a[y * rw + x] = view[(y0 + y) * W + (x0 + x)];
-                region_b[y * rw + x] = rp[(y0 - dy + y) * W + (x0 - dx + x)];
-              }
-          float s = blpoc_region (region_a, region_b, rw, rh, rw);
-          if (s > best)
-            best = s;
+          jobs[t] = (MatchJob) { fv, views, rp, fp, n_views * t / nthreads, n_views * (t + 1) / nthreads, 0 };
+          threads[t] = t + 1 < nthreads ? g_thread_new ("gx534b-match", match_job, &jobs[t]) : NULL;
+        }
+      match_job (&jobs[nthreads - 1]);       /* the last chunk on this thread */
+      for (int t = 0; t < nthreads; t++)
+        {
+          if (threads[t])
+            g_thread_join (threads[t]);
+          if (jobs[t].best > best)
+            best = jobs[t].best;
         }
     }
   return best;

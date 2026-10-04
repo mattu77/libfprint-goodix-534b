@@ -39,7 +39,8 @@
 #define GX534B_FRAME_W 108
 #define GX534B_FRAME_H 88
 
-#define GX534B_MATCH_THRESHOLD 0.45f     /* BLPOC peak: genuine >= ~0.6, impostor <= ~0.29 */
+#define GX534B_MATCH_THRESHOLD 0.40f     /* BLPOC peak: genuine >= ~0.6, impostor <= ~0.29 */
+#define GX534B_MATCH_EARLY_EXIT 0.80f    /* a view this good ends the search (and needs no learning) */
 
 /* Build a ridge map view (GX534B_VIEW_PIXELS floats) from a raw decoded frame and
  * the stored calibration frame (both GX534B_FRAME_W*GX534B_FRAME_H, 12-bit). */

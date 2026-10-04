@@ -48,6 +48,7 @@
 
 #define IMAGE_TIMEOUT_MS 3000
 #define FDT_POLL_TIMEOUT_MS 400    /* a present finger answers 0x32 within ~40 ms */
+#define FDT_UP_TIMEOUT_MS 400      /* fdt_up often does not answer at all: do not wait long */
 #define FDT_WAIT_TIMEOUT_MS 300    /* finger wait: re-poll 0x32 this often */
 #define GARBAGE_STDDEV 900.0       /* no capture yet: ~1180, real frames: ~500-650 */
 #define LIFT_CLEAR_POLLS 2
@@ -61,17 +62,20 @@
  * used in later matches, so the covered finger area grows with use. */
 #define LEARN_DIR "/var/lib/fprint/goodixtls534b-learned"
 #define LEARN_MAX 24
-#define LEARN_BELOW 0.80f
+#define LEARN_BELOW GX534B_MATCH_EARLY_EXIT
 
 struct _FpiDeviceGoodixTls534b
 {
   FpiDeviceGoodixTls parent;
 
   guint16 *baseline;    /* stored calibration frame (fixed pattern), per open */
-  guint16 *finger;      /* decoded frame with the finger down (last one) */
-  guint16 *finger1;     /* the earlier frame of the same touch, if two were taken */
-  float   *probe;       /* ridge map of the last touch */
-  float   *probe1;      /* ridge map of the earlier frame, or NULL */
+  guint16 *finger;      /* decoded frame of the current touch, not yet turned into a probe */
+  float   *probe;       /* ridge map of the latest frame */
+  float    last_score;  /* score of the latest matched frame */
+  gboolean touch_active;   /* a touch state machine is running */
+  gboolean touch_pending;  /* an action asked for a touch while one was still lifting */
+  gboolean action_done;    /* the current action's result has been reported */
+  gboolean close_pending;  /* close requested while a touch was still winding down */
   int      lift_clear;  /* consecutive polls without a finger */
 
   GByteArray *enroll_views;   /* quantized views collected so far */
@@ -285,27 +289,6 @@ learn_view (const gchar *path, const gint8 *all, int n_views, int n_learned, con
     fp_warn ("could not save learned view: %s", err->message);
   else
     fp_dbg ("learned view %d/%d saved", n_learned + 1, LEARN_MAX);
-}
-
-/* Score of the touch: the last frame, and the earlier one if that misses. */
-static float
-match_touch (FpiDeviceGoodixTls534b *self, const gint8 *views, int n, const float **used)
-{
-  float s = gx534b_match (self->probe, views, n);
-
-  *used = self->probe;
-  if (s < GX534B_MATCH_THRESHOLD && self->probe1)
-    {
-      float s1 = gx534b_match (self->probe1, views, n);
-
-      fp_dbg ("first frame: score %.2f", s1);
-      if (s1 > s)
-        {
-          s = s1;
-          *used = self->probe1;
-        }
-    }
-  return s;
 }
 
 /* ---- open: init commands, TLS, config, calibration frame ---------------- */
@@ -682,30 +665,55 @@ dev_open (FpDevice *dev)
 }
 
 static void
-dev_close (FpDevice *dev)
+do_close (FpDevice *dev)
 {
   FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
   GError *error = NULL;
 
+  self->close_pending = FALSE;
+
   goodix_dev_deinit (dev, &error);
   g_clear_pointer (&self->baseline, g_free);
   g_clear_pointer (&self->finger, g_free);
-  g_clear_pointer (&self->finger1, g_free);
   g_clear_pointer (&self->probe, g_free);
-  g_clear_pointer (&self->probe1, g_free);
+  /* a touch that was still waiting for the lift cannot complete after deinit */
+  self->touch_active = FALSE;
+  self->touch_pending = FALSE;
   fpi_device_close_complete (dev, error);
 }
 
-/* ---- one touch: wait, capture, ridge map, wait for lift ----------------- */
+/* fprintd may close as soon as the result is reported, while the touch is still
+ * waiting for the finger to lift; let that finish first (at most one poll). */
+static void
+dev_close (FpDevice *dev)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
 
+  if (self->touch_active)
+    {
+      fp_dbg ("close requested during a touch; deferring");
+      self->close_pending = TRUE;
+      return;
+    }
+  do_close (dev);
+}
+
+/* ---- one touch: wait, capture, match right away, then wait for the lift -------- */
+
+/* The frame captured by the finger-down event itself is not settled yet, and a new
+ * capture needs an fdt_up/fdt_down re-arm (0x34 is answered only when the finger
+ * leaves, so only its ACK is awaited there). */
 enum touch_states {
   TOUCH_FDT_DOWN,        /* poll until a finger is present */
+  TOUCH_REARM_1,         /* 0x34 ack */
+  TOUCH_FDT_DOWN_1,      /* 0x32: new capture of the settled finger */
   TOUCH_IMG_1,
-  TOUCH_REARM_UP,
-  TOUCH_FDT_DOWN_2,      /* second frame if the finger is still there */
+  TOUCH_DECIDE_1,        /* verify/identify: match right away */
+  TOUCH_REARM_2,         /* second chance while the finger is still down */
+  TOUCH_FDT_DOWN_2,
   TOUCH_IMG_2,
-  TOUCH_PROBE,
-  TOUCH_LIFT_UP,         /* poll fdt_up + fdt_down until the finger is gone */
+  TOUCH_DECIDE_2,
+  TOUCH_LIFT_UP,         /* 0x34 answers when the finger is gone */
   TOUCH_LIFT_POLL,
   TOUCH_NUM_STATES,
 };
@@ -713,7 +721,14 @@ enum touch_states {
 static gboolean
 check_cancelled (FpDevice *dev, FpiSsm *ssm)
 {
-  if (!fpi_device_action_is_cancelled (dev))
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
+  if (self->close_pending)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED, "closing"));
+      return TRUE;
+    }
+  if (self->action_done || !fpi_device_action_is_cancelled (dev))
     return FALSE;
   fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_CANCELLED, "cancelled"));
   return TRUE;
@@ -759,24 +774,34 @@ on_fdt_down (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err
     }
 }
 
+/* re-armed fdt_down: capture while the finger is still there; if it is already gone,
+ * the first round still reads the frame from the finger-down event, the second
+ * round decides on what it has */
 static void
-on_fdt_down_2 (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
+on_fdt_down_rearmed (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *err)
 {
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+  gboolean first = fpi_ssm_get_cur_state (ssm) == TOUCH_FDT_DOWN_1;
+  gboolean down = FALSE;
+
   if (err)
     {
-      if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+      if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) &&
+          !g_error_matches (err, G_IO_ERROR, G_IO_ERROR_HOST_UNREACHABLE))
         {
           fpi_ssm_mark_failed (ssm, err);
           return;
         }
       g_error_free (err);
-      fpi_ssm_jump_to_state (ssm, TOUCH_PROBE);   /* keep the first frame */
-      return;
     }
-  if (fdt_finger_down (data, len))
-    fpi_ssm_next_state (ssm);
   else
-    fpi_ssm_jump_to_state (ssm, TOUCH_PROBE);
+    {
+      down = fdt_finger_down (data, len);
+    }
+  if (down || (first && !self->probe))
+    fpi_ssm_next_state (ssm);                 /* capture */
+  else
+    fpi_ssm_jump_to_state (ssm, first ? TOUCH_DECIDE_1 : TOUCH_DECIDE_2);
 }
 
 static void
@@ -798,8 +823,7 @@ on_finger_image (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError 
       return;
     }
   fp_dbg ("finger frame stddev %.0f", frame_stddev (px));
-  g_free (self->finger1);
-  self->finger1 = self->finger;   /* the first frame of this touch, if any */
+  g_free (self->finger);
   self->finger = px;
   fpi_ssm_next_state (ssm);
 }
@@ -812,7 +836,8 @@ on_lift_poll (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *er
 
   if (err)
     {
-      if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+      if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_TIMED_OUT) &&
+          !g_error_matches (err, G_IO_ERROR, G_IO_ERROR_HOST_UNREACHABLE))
         {
           fpi_ssm_mark_failed (ssm, err);
           return;
@@ -827,13 +852,143 @@ on_lift_poll (FpDevice *dev, guint8 *data, guint16 len, gpointer ssm, GError *er
   self->lift_clear = down ? 0 : self->lift_clear + 1;
   if (self->lift_clear >= LIFT_CLEAR_POLLS)
     {
-      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE, FP_FINGER_STATUS_PRESENT);
+      if (!self->action_done || fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL)
+        fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE, FP_FINGER_STATUS_PRESENT);
       fpi_ssm_next_state (ssm);
     }
   else if (!check_cancelled (dev, ssm))
     {
       fpi_ssm_jump_to_state (ssm, TOUCH_LIFT_UP);
     }
+}
+
+/* ---- matching and reporting ------------------------------------------------- */
+
+static void
+report_fail (FpDevice *dev)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+  if (self->action_done)
+    return;
+  self->action_done = TRUE;
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    {
+      fpi_device_verify_report (dev, FPI_MATCH_FAIL, NULL, NULL);
+      fpi_device_verify_complete (dev, NULL);
+    }
+  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      fpi_device_identify_report (dev, NULL, NULL, NULL);
+      fpi_device_identify_complete (dev, NULL);
+    }
+}
+
+/* Match self->probe for the current verify/identify action. Reports and completes
+ * the action on a match, or on a miss when @last; returns TRUE when reported. */
+static gboolean
+match_and_report (FpDevice *dev, gboolean last)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+
+  if (action == FPI_DEVICE_ACTION_VERIFY)
+    {
+      g_autoptr(GVariant) keep = NULL;
+      FpPrint *print = NULL;
+      const gint8 *views;
+      int n_views = 0, n_all, n_learned;
+      g_autofree gchar *path = NULL;
+      g_autofree gint8 *all = NULL;
+      float score;
+
+      fpi_device_get_verify_data (dev, &print);
+      views = template_views (print, &n_views, &keep);
+      if (!views)
+        {
+          self->action_done = TRUE;
+          fpi_device_verify_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
+                                                                     "print is not a goodixtls534b template"));
+          return TRUE;
+        }
+      path = learned_path (views, n_views);
+      all = all_views (views, n_views, path, &n_all, &n_learned);
+      score = gx534b_match (self->probe, all, n_all);
+      self->last_score = score;
+      fp_dbg ("verify: score %.2f over %d views (%d learned, threshold %.2f)%s",
+              score, n_all, n_learned, GX534B_MATCH_THRESHOLD, last ? " [2nd frame]" : "");
+      if (score >= GX534B_MATCH_THRESHOLD)
+        {
+          if (score < LEARN_BELOW)
+            learn_view (path, all, n_views, n_learned, self->probe);
+          self->action_done = TRUE;
+          fpi_device_verify_report (dev, FPI_MATCH_SUCCESS, NULL, NULL);
+          fpi_device_verify_complete (dev, NULL);
+          return TRUE;
+        }
+    }
+  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      GPtrArray *prints = NULL;
+      FpPrint *best = NULL;
+      float best_score = 0;
+      g_autofree gchar *best_path = NULL;
+      g_autofree gint8 *best_all = NULL;
+      int best_n_views = 0, best_n_learned = 0;
+
+      fpi_device_get_identify_data (dev, &prints);
+      for (guint i = 0; prints && i < prints->len; i++)
+        {
+          g_autoptr(GVariant) keep = NULL;
+          FpPrint *print = g_ptr_array_index (prints, i);
+          int n_views = 0, n_all, n_learned;
+          const gint8 *views = template_views (print, &n_views, &keep);
+          gchar *path;
+          gint8 *all;
+          float score;
+
+          if (!views)
+            continue;
+          path = learned_path (views, n_views);
+          all = all_views (views, n_views, path, &n_all, &n_learned);
+          score = gx534b_match (self->probe, all, n_all);
+          fp_dbg ("identify: print %u score %.2f over %d views (%d learned)%s",
+                  i, score, n_all, n_learned, last ? " [2nd frame]" : "");
+          if (score > best_score)
+            {
+              best_score = score; best = print;
+              g_free (best_path); best_path = path;
+              g_free (best_all); best_all = all;
+              best_n_views = n_views; best_n_learned = n_learned;
+            }
+          else
+            {
+              g_free (path); g_free (all);
+            }
+        }
+      self->last_score = best_score;
+      if (best && best_score >= GX534B_MATCH_THRESHOLD)
+        {
+          if (best_score < LEARN_BELOW)
+            learn_view (best_path, best_all, best_n_views, best_n_learned, self->probe);
+          self->action_done = TRUE;
+          fpi_device_identify_report (dev, best, NULL, NULL);
+          fpi_device_identify_complete (dev, NULL);
+          return TRUE;
+        }
+    }
+  else
+    {
+      return FALSE;   /* enroll: nothing to match */
+    }
+
+  if (last)
+    {
+      report_fail (dev);
+      return TRUE;
+    }
+  return FALSE;
 }
 
 static void
@@ -856,32 +1011,57 @@ touch_run_state (FpiSsm *ssm, FpDevice *dev)
                                      IMAGE_TIMEOUT_MS, on_finger_image, ssm);
       break;
 
-    case TOUCH_REARM_UP:
-    case TOUCH_LIFT_UP:
+    case TOUCH_DECIDE_1:
+    case TOUCH_DECIDE_2:
+      {
+        gboolean last = fpi_ssm_get_cur_state (ssm) == TOUCH_DECIDE_2;
+        gboolean new_frame = self->finger != NULL;
+
+        if (new_frame)
+          {
+            if (!self->probe)
+              self->probe = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
+            gx534b_prep_view (self->finger, self->baseline, self->probe);
+            g_clear_pointer (&self->finger, g_free);
+          }
+        if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL || self->action_done)
+          {
+            /* enrollment keeps the later frame and reports after the lift */
+            if (last)
+              fpi_ssm_jump_to_state (ssm, TOUCH_LIFT_UP);
+            else
+              fpi_ssm_next_state (ssm);
+            break;
+          }
+        if (!new_frame)
+          report_fail (dev);                 /* nothing new to match: it is a miss */
+        else
+          match_and_report (dev, last);
+        self->lift_clear = 0;
+        if (self->action_done || last)
+          fpi_ssm_jump_to_state (ssm, TOUCH_LIFT_UP);
+        else
+          fpi_ssm_next_state (ssm);
+        break;
+      }
+
+    case TOUCH_REARM_1:
+    case TOUCH_REARM_2:
+      /* ack only: the data frame of 0x34 comes when the finger leaves */
       send_raw (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP, goodix_534b_fdt_up,
-                sizeof (goodix_534b_fdt_up), TRUE, 1500, cb_fdt_up, ssm);
+                sizeof (goodix_534b_fdt_up), FALSE, FDT_UP_TIMEOUT_MS, cb_fdt_up, ssm);
       break;
 
+    case TOUCH_FDT_DOWN_1:
     case TOUCH_FDT_DOWN_2:
       send_raw (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, goodix_534b_fdt_down,
                 sizeof (goodix_534b_fdt_down), TRUE, FDT_POLL_TIMEOUT_MS,
-                on_fdt_down_2, ssm);
+                on_fdt_down_rearmed, ssm);
       break;
 
-    case TOUCH_PROBE:
-      if (!self->probe)
-        self->probe = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
-      gx534b_prep_view (self->finger, self->baseline, self->probe);
-      g_clear_pointer (&self->finger, g_free);
-      g_clear_pointer (&self->probe1, g_free);
-      if (self->finger1)
-        {
-          self->probe1 = g_malloc (GX534B_VIEW_PIXELS * sizeof (float));
-          gx534b_prep_view (self->finger1, self->baseline, self->probe1);
-          g_clear_pointer (&self->finger1, g_free);
-        }
-      self->lift_clear = 0;
-      fpi_ssm_next_state (ssm);
+    case TOUCH_LIFT_UP:
+      send_raw (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP, goodix_534b_fdt_up,
+                sizeof (goodix_534b_fdt_up), TRUE, FDT_UP_TIMEOUT_MS, cb_fdt_up, ssm);
       break;
 
     case TOUCH_LIFT_POLL:
@@ -899,15 +1079,28 @@ touch_start (FpDevice *dev)
 {
   FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
 
+  self->touch_active = TRUE;
+  self->touch_pending = FALSE;
+  self->close_pending = FALSE;
+  self->action_done = FALSE;
   self->lift_clear = 0;
   self->no_ack = 0;
   g_clear_pointer (&self->finger, g_free);
-  g_clear_pointer (&self->finger1, g_free);
   fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED, FP_FINGER_STATUS_NONE);
   fpi_ssm_start (fpi_ssm_new (dev, touch_run_state, TOUCH_NUM_STATES), touch_complete);
 }
 
-/* ---- actions ------------------------------------------------------------ */
+/* an action may start while the previous touch is still waiting for the lift */
+static void
+touch_request (FpDevice *dev)
+{
+  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
+
+  if (self->touch_active)
+    self->touch_pending = TRUE;
+  else
+    touch_start (dev);
+}
 
 static void
 enroll_touch_done (FpDevice *dev)
@@ -933,91 +1126,8 @@ enroll_touch_done (FpDevice *dev)
   fpi_print_set_device_stored (print, FALSE);
   g_object_set (print, "fpi-data", template_new (self->enroll_views, self->enroll_stage), NULL);
   g_clear_pointer (&self->enroll_views, g_byte_array_unref);
+  self->action_done = TRUE;
   fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
-}
-
-static void
-verify_touch_done (FpDevice *dev)
-{
-  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
-  g_autoptr(GVariant) keep = NULL;
-  FpPrint *print = NULL;
-  const gint8 *views;
-  int n_views = 0;
-  float score;
-
-  fpi_device_get_verify_data (dev, &print);
-  views = template_views (print, &n_views, &keep);
-  if (!views)
-    {
-      fpi_device_verify_complete (dev, fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
-                                                                 "print is not a goodixtls534b template"));
-      return;
-    }
-  {
-    g_autofree gchar *path = learned_path (views, n_views);
-    int n_all, n_learned;
-    g_autofree gint8 *all = all_views (views, n_views, path, &n_all, &n_learned);
-    const float *used;
-
-    score = match_touch (self, all, n_all, &used);
-    fp_dbg ("verify: score %.2f over %d views (%d learned, threshold %.2f)",
-            score, n_all, n_learned, GX534B_MATCH_THRESHOLD);
-    if (score >= GX534B_MATCH_THRESHOLD && score < LEARN_BELOW)
-      learn_view (path, all, n_views, n_learned, used);
-  }
-  fpi_device_verify_report (dev, score >= GX534B_MATCH_THRESHOLD ? FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
-                            NULL, NULL);
-  fpi_device_verify_complete (dev, NULL);
-}
-
-static void
-identify_touch_done (FpDevice *dev)
-{
-  FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
-  GPtrArray *prints = NULL;
-  FpPrint *best = NULL;
-  float best_score = 0;
-  g_autofree gchar *best_path = NULL;
-  g_autofree gint8 *best_all = NULL;
-  int best_n_views = 0, best_n_learned = 0;
-  const float *best_used = NULL;
-
-  fpi_device_get_identify_data (dev, &prints);
-  for (guint i = 0; prints && i < prints->len; i++)
-    {
-      g_autoptr(GVariant) keep = NULL;
-      FpPrint *print = g_ptr_array_index (prints, i);
-      int n_views = 0;
-      const gint8 *views = template_views (print, &n_views, &keep);
-      float score;
-
-      if (!views)
-        continue;
-      {
-        g_autofree gchar *path = learned_path (views, n_views);
-        int n_all, n_learned;
-        gint8 *all = all_views (views, n_views, path, &n_all, &n_learned);
-        const float *used;
-
-        score = match_touch (self, all, n_all, &used);
-        fp_dbg ("identify: print %u score %.2f over %d views (%d learned)", i, score, n_all, n_learned);
-        if (score > best_score)
-          {
-            best_score = score;
-            best = print;
-            g_free (best_path); best_path = g_steal_pointer (&path);
-            g_free (best_all); best_all = all;
-            best_n_views = n_views; best_n_learned = n_learned; best_used = used;
-          }
-        else
-          g_free (all);
-      }
-    }
-  if (best && best_score >= GX534B_MATCH_THRESHOLD && best_score < LEARN_BELOW)
-    learn_view (best_path, best_all, best_n_views, best_n_learned, best_used);
-  fpi_device_identify_report (dev, best_score >= GX534B_MATCH_THRESHOLD ? best : NULL, NULL, NULL);
-  fpi_device_identify_complete (dev, NULL);
 }
 
 static void
@@ -1025,23 +1135,38 @@ touch_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceGoodixTls534b *self = FPI_DEVICE_GOODIXTLS534B (dev);
 
-  if (error)
+  self->touch_active = FALSE;
+  if (self->close_pending)
     {
-      fp_dbg ("touch failed: %s", error->message);
-      g_clear_pointer (&self->enroll_views, g_byte_array_unref);
-      fpi_device_action_error (dev, error);
+      /* verify/identify already reported; fprintd closed the device meanwhile */
+      g_clear_error (&error);
+      self->touch_pending = FALSE;
+      do_close (dev);
       return;
     }
-  FpiDeviceAction action = fpi_device_get_current_action (dev);
+  if (error)
+    {
+      fp_dbg ("touch ended with: %s", error->message);
+      if (self->action_done)
+        g_error_free (error);
+      else
+        {
+          g_clear_pointer (&self->enroll_views, g_byte_array_unref);
+          fpi_device_action_error (dev, error);
+        }
+    }
+  else if (fpi_device_get_current_action (dev) == FPI_DEVICE_ACTION_ENROLL && !self->action_done)
+    {
+      enroll_touch_done (dev);
+      return;   /* enroll_touch_done starts the next touch itself */
+    }
+  else if (!self->action_done)
+    {
+      report_fail (dev);
+    }
 
-  if (action == FPI_DEVICE_ACTION_ENROLL)
-    enroll_touch_done (dev);
-  else if (action == FPI_DEVICE_ACTION_VERIFY)
-    verify_touch_done (dev);
-  else if (action == FPI_DEVICE_ACTION_IDENTIFY)
-    identify_touch_done (dev);
-  else
-    fpi_device_action_error (dev, fpi_device_error_new (FP_DEVICE_ERROR_NOT_SUPPORTED));
+  if (self->touch_pending)
+    touch_start (dev);
 }
 
 static void
@@ -1052,19 +1177,19 @@ dev_enroll (FpDevice *dev)
   g_clear_pointer (&self->enroll_views, g_byte_array_unref);
   self->enroll_views = g_byte_array_new ();
   self->enroll_stage = 0;
-  touch_start (dev);
+  touch_request (dev);
 }
 
 static void
 dev_verify (FpDevice *dev)
 {
-  touch_start (dev);
+  touch_request (dev);
 }
 
 static void
 dev_identify (FpDevice *dev)
 {
-  touch_start (dev);
+  touch_request (dev);
 }
 
 /* ---- class -------------------------------------------------------------- */

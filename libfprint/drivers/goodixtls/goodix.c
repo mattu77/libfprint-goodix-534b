@@ -1234,9 +1234,9 @@ goodix_dev_deinit (FpDevice *dev, GError **error)
   FpiDeviceGoodixTlsPrivate *priv =
     fpi_device_goodixtls_get_instance_private (self);
 
-  if (priv->timeout)
-    g_source_destroy (priv->timeout);
-  g_free (priv->data);
+  g_clear_pointer (&priv->timeout, g_source_destroy);
+  g_clear_pointer (&priv->data, g_free);
+  priv->length = 0;
   g_cancellable_cancel (priv->transfer_cancel_tkn);
   goodix_shutdown_tls (dev, error);
 
